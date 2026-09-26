@@ -879,7 +879,7 @@ To Do — Cloud Persistent Single-File App (Cloud Firestore + Anonymous Auth)
       <!-- Device & Sync Section -->
       <div class="setting-section" id="device-settings">
         <p class="section-title">Device &amp; Sync</p>
-        <p class="section-desc">Sign into the same Google account on each device to sync automatically.</p>
+        <p class="section-desc">Sign into the same account on each device to sync automatically. Use email and password for file-opened copies.</p>
         <div class="panel">
           <div class="category-row" style="padding: 12px 8px;">
             <span style="font-size:13.5px; color:var(--ink-muted); width:90px; flex-shrink:0;">This device</span>
@@ -892,6 +892,12 @@ To Do — Cloud Persistent Single-File App (Cloud Firestore + Anonymous Auth)
               <div id="syncAccountStatus" style="font-size:12px; color:var(--ink-faint); margin-top:3px;">Not connected</div>
             </div>
             <button class="btn-outline" type="button" id="signInGoogleBtn" style="padding:5px 12px; font-size:12.5px;">Connect Google account</button>
+          </div>
+          <div class="add-inline sync-email-row" style="padding:12px 8px; flex-wrap:wrap;">
+            <input type="email" id="syncAccountEmail" autocomplete="username" placeholder="Email address" aria-label="Sync account email">
+            <input type="password" id="syncAccountPassword" autocomplete="current-password" placeholder="Password" aria-label="Sync account password">
+            <button class="btn-outline" type="button" id="signInEmailBtn" style="padding:5px 12px; font-size:12.5px;">Sign in</button>
+            <button class="btn-outline" type="button" id="createEmailAccountBtn" style="padding:5px 12px; font-size:12.5px;">Create account</button>
           </div>
           <div class="category-row" style="padding: 12px 8px; flex-wrap:wrap; gap:8px;">
             <div style="flex:1; min-width:180px;">
@@ -1565,16 +1571,82 @@ To Do — Cloud Persistent Single-File App (Cloud Firestore + Anonymous Auth)
     var button = document.getElementById("signInGoogleBtn");
     var status = document.getElementById("syncAccountStatus");
     if (!button || !status) return;
+    var fileMode = window.location.protocol === "file:";
+    var googleLinked = !!(user && user.providerData && user.providerData.some(function (provider) { return provider.providerId === "google.com"; }));
     if (user && !user.isAnonymous) {
-      status.textContent = user.email || "Connected to Google";
-      button.textContent = "Connected";
-      button.disabled = true;
+      status.textContent = "Connected as " + (user.email || "your account") + ". Use this same account on each device.";
+      button.textContent = googleLinked ? "Google connected" : "Connect Google account";
+      button.disabled = fileMode || googleLinked || !auth;
     } else {
-      status.textContent = "Use the same Google account on each device.";
+      status.textContent = fileMode
+        ? "File mode: sign in with the same email and password on each copy."
+        : "Use the same Google or email account on each device.";
       button.textContent = "Connect Google account";
-      button.disabled = false;
+      button.disabled = fileMode || !auth;
     }
+    document.getElementById("signInEmailBtn").disabled = !auth;
+    document.getElementById("createEmailAccountBtn").disabled = !auth;
   }
+
+  function connectEmailAccount(createAccount) {
+    var email = document.getElementById("syncAccountEmail").value.trim();
+    var password = document.getElementById("syncAccountPassword").value;
+    var status = document.getElementById("syncAccountStatus");
+    if (!auth) {
+      if (status) status.textContent = "Firebase Authentication is unavailable in this copy.";
+      return;
+    }
+    if (!email || !password) {
+      if (status) status.textContent = "Enter an email address and password.";
+      return;
+    }
+
+    var fileLocalWorkspace = window.location.protocol === "file:" && (!isFirebaseConfigured || !db);
+    var previousWorkspaceId = activeUid || localStorage.getItem("todo_sync_uid");
+    localStorage.setItem("todo_pending_workspace_migration", previousWorkspaceId || "");
+    document.getElementById("signInEmailBtn").disabled = true;
+    document.getElementById("createEmailAccountBtn").disabled = true;
+    if (status) status.textContent = createAccount ? "Creating account..." : "Signing in...";
+
+    var accountRequest = createAccount
+      ? auth.createUserWithEmailAndPassword(email, password)
+      : auth.signInWithEmailAndPassword(email, password);
+    accountRequest.then(function (credential) {
+      var targetUid = credential.user.uid;
+      if (fileLocalWorkspace) {
+        db = firebase.firestore();
+        isFirebaseConfigured = true;
+        return migrateLocalWorkspaceData(targetUid);
+      }
+      return migrateWorkspaceData(previousWorkspaceId, targetUid);
+    }).then(function (credentialOrUndefined) {
+      var user = auth.currentUser;
+      if (!user) throw new Error("Firebase did not return the signed-in account.");
+      localStorage.setItem("todo_sync_uid", user.uid);
+      localStorage.removeItem("todo_pending_workspace_migration");
+      document.getElementById("syncAccountPassword").value = "";
+      window.location.reload();
+      return credentialOrUndefined;
+    }).catch(function (err) {
+      console.error("Email account sync failed:", err);
+      localStorage.removeItem("todo_pending_workspace_migration");
+      updateSyncAccountUI(auth.currentUser);
+      if (status) {
+        if (err.code === "auth/operation-not-allowed") status.textContent = "Enable Email/Password sign-in in Firebase Authentication.";
+        else if (err.code === "auth/weak-password") status.textContent = "Use a password with at least 6 characters.";
+        else if (err.code === "auth/email-already-in-use") status.textContent = "That email already has an account. Choose Sign in.";
+        else if (err.code === "auth/user-not-found" || err.code === "auth/wrong-password" || err.code === "auth/invalid-credential") status.textContent = "Email or password is incorrect. For a new account, choose Create account.";
+        else status.textContent = "Could not connect this account. Check Firebase Authentication settings.";
+      }
+    });
+  }
+
+  document.getElementById("signInEmailBtn").addEventListener("click", function () {
+    connectEmailAccount(false);
+  });
+  document.getElementById("createEmailAccountBtn").addEventListener("click", function () {
+    connectEmailAccount(true);
+  });
 
   document.getElementById("signInGoogleBtn").addEventListener("click", function () {
     if (!auth || !firebase || !firebase.auth) return;
@@ -1692,6 +1764,48 @@ To Do — Cloud Persistent Single-File App (Cloud Firestore + Anonymous Auth)
         if (Object.keys(missingSettings).length) return targetSettingsRef.set(missingSettings, { merge: true });
       });
     }));
+    return Promise.all(migrations);
+  }
+
+  function copyMissingLocalRecords(targetRef, records) {
+    return targetRef.get().then(function (snapshot) {
+      var existingIds = {};
+      snapshot.forEach(function (doc) { existingIds[doc.id] = true; });
+      var missing = records.filter(function (record) { return record && record.id && !existingIds[record.id]; });
+      var commits = [];
+      for (var start = 0; start < missing.length; start += 450) {
+        var batch = db.batch();
+        missing.slice(start, start + 450).forEach(function (record) {
+          var data = Object.assign({}, record);
+          delete data.id;
+          batch.set(targetRef.doc(record.id), data);
+        });
+        commits.push(batch.commit());
+      }
+      return Promise.all(commits);
+    });
+  }
+
+  function migrateLocalWorkspaceData(targetUid) {
+    if (!db || !targetUid) return Promise.reject(new Error("Firebase is not available."));
+    var userRef = db.collection("users").doc(targetUid);
+    var settingsRef = userRef.collection("settings").doc("preferences");
+    var localSettings = Object.assign({}, settings);
+    delete localSettings.autoSync;
+    var migrations = [
+      copyMissingLocalRecords(userRef.collection("tasks"), tasks),
+      copyMissingLocalRecords(userRef.collection("categories"), categories),
+      copyMissingLocalRecords(userRef.collection("tags"), tags),
+      settingsRef.get().then(function (snapshot) {
+        if (!snapshot.exists) return settingsRef.set(localSettings);
+        var currentSettings = snapshot.data() || {};
+        var missingSettings = {};
+        Object.keys(localSettings).forEach(function (key) {
+          if (!Object.prototype.hasOwnProperty.call(currentSettings, key)) missingSettings[key] = localSettings[key];
+        });
+        if (Object.keys(missingSettings).length) return settingsRef.set(missingSettings, { merge: true });
+      })
+    ];
     return Promise.all(migrations);
   }
 
@@ -1977,16 +2091,13 @@ To Do — Cloud Persistent Single-File App (Cloud Firestore + Anonymous Auth)
     loadLocalStore();
   }
 
-  function startLocalFileMode() {
+  function startLocalFileMode(user) {
     isFirebaseConfigured = false;
     db = null;
-    auth = null;
     activeUid = getTargetUid();
-    updateSyncAccountUI(null);
+    updateSyncAccountUI(user);
     var status = document.getElementById("syncAccountStatus");
-    var googleButton = document.getElementById("signInGoogleBtn");
-    if (status) status.textContent = "Local file mode. Use backups to move data between devices.";
-    if (googleButton) googleButton.disabled = true;
+    if (status) status.textContent = "File mode: sign in with the same email and password on each copy for Firebase sync.";
     renderDeviceList(null);
     loadLocalStore();
   }
@@ -1994,11 +2105,6 @@ To Do — Cloud Persistent Single-File App (Cloud Firestore + Anonymous Auth)
   function initApp() {
     renderHeaderDate();
     initDeviceName();
-
-    if (window.location.protocol === "file:") {
-      startLocalFileMode();
-      return;
-    }
 
     isFirebaseConfigured = checkFirebaseConfig();
 
@@ -2020,8 +2126,27 @@ To Do — Cloud Persistent Single-File App (Cloud Firestore + Anonymous Auth)
       if (!firebase.apps.length) {
         firebase.initializeApp(firebaseConfig);
       }
-      db = firebase.firestore();
       auth = firebase.auth();
+      if (window.location.protocol === "file:") {
+        var fileAuthStateHandled = false;
+        auth.onAuthStateChanged(function (user) {
+          if (fileAuthStateHandled) return;
+          fileAuthStateHandled = true;
+          if (user && !user.isAnonymous) {
+            db = firebase.firestore();
+            isFirebaseConfigured = true;
+            initializeFirebaseUser(user).catch(handleFirebaseAuthFailure);
+          } else {
+            startLocalFileMode(user);
+          }
+        }, function (err) {
+          console.warn("File-mode Firebase auth state unavailable:", err);
+          startLocalFileMode(null);
+        });
+        return;
+      }
+
+      db = firebase.firestore();
       var initialAuthStateHandled = false;
       auth.onAuthStateChanged(function (user) {
         if (initialAuthStateHandled) return;
