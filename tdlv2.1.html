@@ -879,7 +879,7 @@ To Do — Cloud Persistent Single-File App (Cloud Firestore + Anonymous Auth)
       <!-- Device & Sync Section -->
       <div class="setting-section" id="device-settings">
         <p class="section-title">Device &amp; Sync</p>
-        <p class="section-desc">Connect devices with the same Sync ID to share your tasks.</p>
+        <p class="section-desc">Sign into the same Google account on each device to sync automatically.</p>
         <div class="panel">
           <div class="category-row" style="padding: 12px 8px;">
             <span style="font-size:13.5px; color:var(--ink-muted); width:90px; flex-shrink:0;">This device</span>
@@ -888,14 +888,10 @@ To Do — Cloud Persistent Single-File App (Cloud Firestore + Anonymous Auth)
           </div>
           <div class="category-row" style="padding: 12px 8px; flex-wrap:wrap; gap:8px;">
             <div style="flex:1; min-width:180px;">
-              <div style="font-size:13.5px; color:var(--ink-muted);">Sync ID</div>
-              <div id="syncIdDisplay" style="font-family:'JetBrains Mono',monospace; font-size:11.5px; color:var(--ink-faint); margin-top:3px; word-break:break-all;">Loading...</div>
+              <div style="font-size:13.5px; color:var(--ink-muted);">Sync account</div>
+              <div id="syncAccountStatus" style="font-size:12px; color:var(--ink-faint); margin-top:3px;">Not connected</div>
             </div>
-            <button class="btn-outline" type="button" id="copySyncLinkBtn" style="padding:5px 12px; font-size:12.5px;">Copy Sync Link</button>
-          </div>
-          <div class="add-inline" style="padding-top:12px;">
-            <input type="text" id="connectSyncIdInput" placeholder="Connect to another device's Sync ID">
-            <button class="btn-outline" type="button" id="connectSyncBtn">Connect</button>
+            <button class="btn-outline" type="button" id="signInGoogleBtn" style="padding:5px 12px; font-size:12.5px;">Connect Google account</button>
           </div>
           <div class="toggle-row">
             <div class="toggle-copy">
@@ -1555,35 +1551,44 @@ To Do — Cloud Persistent Single-File App (Cloud Firestore + Anonymous Auth)
     setTimeout(function () { btn.textContent = orig; }, 1500);
   });
 
-  document.getElementById("copySyncLinkBtn").addEventListener("click", function () {
-    if (!activeUid) return;
-    var btn = this;
-    var url = window.location.origin + window.location.pathname + "?sync=" + encodeURIComponent(activeUid);
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(url).then(function () {
-        var orig = btn.textContent;
-        btn.textContent = "Link Copied!";
-        setTimeout(function () { btn.textContent = orig; }, 2000);
-      }).catch(function () {
-        prompt("Copy your cross-device Sync Link:", url);
-      });
+  function updateSyncAccountUI(user) {
+    var button = document.getElementById("signInGoogleBtn");
+    var status = document.getElementById("syncAccountStatus");
+    if (!button || !status) return;
+    if (user && !user.isAnonymous) {
+      status.textContent = user.email || "Connected to Google";
+      button.textContent = "Connected";
+      button.disabled = true;
     } else {
-      prompt("Copy your cross-device Sync Link:", url);
+      status.textContent = "Use the same Google account on each device.";
+      button.textContent = "Connect Google account";
+      button.disabled = false;
     }
-  });
+  }
 
-  document.getElementById("connectSyncBtn").addEventListener("click", function () {
-    var input = document.getElementById("connectSyncIdInput");
-    var targetUid = input.value.trim();
-    if (!targetUid) return;
-    localStorage.setItem("todo_sync_uid", targetUid);
-    window.location.search = "sync=" + encodeURIComponent(targetUid);
-  });
-
-  document.getElementById("connectSyncIdInput").addEventListener("keydown", function (e) {
-    if (e.key === "Enter") {
-      document.getElementById("connectSyncBtn").click();
-    }
+  document.getElementById("signInGoogleBtn").addEventListener("click", function () {
+    if (!auth || !firebase || !firebase.auth) return;
+    var button = this;
+    var previousWorkspaceId = activeUid || localStorage.getItem("todo_sync_uid");
+    localStorage.setItem("todo_pending_workspace_migration", previousWorkspaceId || "");
+    button.disabled = true;
+    button.textContent = "Connecting...";
+    var provider = new firebase.auth.GoogleAuthProvider();
+    auth.signInWithPopup(provider).then(function (result) {
+      return migrateWorkspaceData(previousWorkspaceId, result.user.uid).then(function () {
+        localStorage.setItem("todo_sync_uid", result.user.uid);
+        localStorage.removeItem("todo_pending_workspace_migration");
+        window.location.reload();
+      });
+    }).catch(function (err) {
+      console.error("Google sign-in failed:", err);
+      button.disabled = false;
+      button.textContent = "Connect Google account";
+      var status = document.getElementById("syncAccountStatus");
+      if (status) status.textContent = err.code === "auth/operation-not-allowed"
+        ? "Enable Google sign-in in Firebase Authentication settings."
+        : "Could not connect. Check the Google sign-in setup and try again.";
+    });
   });
 
   function updateSyncStatus(text) {
@@ -1623,12 +1628,61 @@ To Do — Cloud Persistent Single-File App (Cloud Firestore + Anonymous Auth)
   }
 
   function getTargetUid(userUid) {
+    if (userUid && typeof userUid === "object" && !userUid.isAnonymous) return userUid.uid;
     var syncUid = localStorage.getItem("todo_sync_uid");
     if (!syncUid) {
       syncUid = createLocalId("sync");
       localStorage.setItem("todo_sync_uid", syncUid);
     }
     return syncUid;
+  }
+
+  function copyMissingWorkspaceCollection(sourceRef, targetRef) {
+    return Promise.all([sourceRef.get(), targetRef.get()]).then(function (snapshots) {
+      var sourceSnapshot = snapshots[0];
+      var targetIds = {};
+      snapshots[1].forEach(function (doc) { targetIds[doc.id] = true; });
+      var missingDocs = [];
+      sourceSnapshot.forEach(function (doc) {
+        if (!targetIds[doc.id]) missingDocs.push(doc);
+      });
+      var commit = Promise.resolve();
+      for (var start = 0; start < missingDocs.length; start += 450) {
+        (function (chunk) {
+          commit = commit.then(function () {
+            var batch = db.batch();
+            chunk.forEach(function (doc) { batch.set(targetRef.doc(doc.id), doc.data()); });
+            return batch.commit();
+          });
+        })(missingDocs.slice(start, start + 450));
+      }
+      return commit;
+    });
+  }
+
+  function migrateWorkspaceData(sourceUid, targetUid) {
+    if (!sourceUid || !targetUid || sourceUid === targetUid || !db) return Promise.resolve();
+    var sourceRef = db.collection("users").doc(sourceUid);
+    var targetRef = db.collection("users").doc(targetUid);
+    var collectionNames = ["tasks", "categories", "tags", "devices"];
+    var migrations = collectionNames.map(function (name) {
+      return copyMissingWorkspaceCollection(sourceRef.collection(name), targetRef.collection(name));
+    });
+    migrations.push(sourceRef.collection("settings").doc("preferences").get().then(function (sourceSettings) {
+      if (!sourceSettings.exists) return;
+      var targetSettingsRef = targetRef.collection("settings").doc("preferences");
+      return targetSettingsRef.get().then(function (targetSettings) {
+        var sourceData = sourceSettings.data() || {};
+        if (!targetSettings.exists) return targetSettingsRef.set(sourceData);
+        var targetData = targetSettings.data() || {};
+        var missingSettings = {};
+        Object.keys(sourceData).forEach(function (key) {
+          if (!Object.prototype.hasOwnProperty.call(targetData, key)) missingSettings[key] = sourceData[key];
+        });
+        if (Object.keys(missingSettings).length) return targetSettingsRef.set(missingSettings, { merge: true });
+      });
+    }));
+    return Promise.all(migrations);
   }
 
   function checkFirebaseConfig() {
@@ -1738,6 +1792,46 @@ To Do — Cloud Persistent Single-File App (Cloud Firestore + Anonymous Auth)
   }
 
   // Firebase initialization
+  function initializeFirebaseUser(user) {
+    var pendingWorkspaceId = localStorage.getItem("todo_pending_workspace_migration");
+    var migration = user && !user.isAnonymous && pendingWorkspaceId
+      ? migrateWorkspaceData(pendingWorkspaceId, user.uid)
+      : Promise.resolve();
+    return migration.then(function () {
+      if (user && !user.isAnonymous) {
+        localStorage.setItem("todo_sync_uid", user.uid);
+        localStorage.removeItem("todo_pending_workspace_migration");
+      }
+      activeUid = getTargetUid(user);
+      updateSyncAccountUI(user);
+      initFirestoreSync(activeUid);
+    }).catch(function (err) {
+      console.error("Could not migrate workspace data:", err);
+      if (user && !user.isAnonymous && pendingWorkspaceId) {
+        activeUid = pendingWorkspaceId;
+        updateSyncAccountUI(null);
+        var migrationStatus = document.getElementById("syncAccountStatus");
+        if (migrationStatus) migrationStatus.textContent = "Signed in, but old workspace data could not be imported yet.";
+        initFirestoreSync(activeUid);
+        return;
+      }
+      throw err;
+    });
+  }
+
+  function handleFirebaseAuthFailure(err) {
+    console.warn("Firebase authentication failed, falling back to local mode:", err);
+    var banner = document.getElementById("configBanner");
+    if (banner) {
+      banner.innerHTML = "<strong>Firebase Auth notice:</strong> Enable Anonymous sign-in in Firebase Authentication to use local preview sync.";
+      banner.style.display = "block";
+    }
+    activeUid = getTargetUid();
+    updateSyncAccountUI(null);
+    renderDeviceList(null);
+    loadLocalStore();
+  }
+
   function initApp() {
     renderHeaderDate();
     initDeviceName();
@@ -1749,8 +1843,11 @@ To Do — Cloud Persistent Single-File App (Cloud Firestore + Anonymous Auth)
       var banner = document.getElementById("configBanner");
       if (banner) banner.style.display = "block";
       activeUid = getTargetUid();
-      var syncDisplay = document.getElementById("syncIdDisplay");
-      if (syncDisplay) syncDisplay.textContent = activeUid + " (Local preview mode)";
+      updateSyncAccountUI(null);
+      var accountStatus = document.getElementById("syncAccountStatus");
+      var accountButton = document.getElementById("signInGoogleBtn");
+      if (accountStatus) accountStatus.textContent = "Cloud sync is unavailable in local preview mode.";
+      if (accountButton) accountButton.disabled = true;
       loadLocalStore();
       return;
     }
@@ -1761,28 +1858,18 @@ To Do — Cloud Persistent Single-File App (Cloud Firestore + Anonymous Auth)
       }
       db = firebase.firestore();
       auth = firebase.auth();
-
-      auth.signInAnonymously().then(function (cred) {
-        var user = cred.user;
-        activeUid = getTargetUid(user.uid);
-
-        var syncDisplay = document.getElementById("syncIdDisplay");
-        if (syncDisplay) syncDisplay.textContent = activeUid;
-
-        initFirestoreSync(activeUid);
-      }).catch(function (err) {
-        console.warn("Firebase Anonymous Auth failed, falling back to local mode:", err);
-        var banner = document.getElementById("configBanner");
-        if (banner) {
-          banner.innerHTML = "<strong>Firebase Auth notice:</strong> Anonymous Auth is not enabled in your Firebase console. Please go to <em>Authentication &gt; Sign-in method &gt; Anonymous</em> and enable it. (Running in local preview mode until enabled).";
-          banner.style.display = "block";
+      var initialAuthStateHandled = false;
+      auth.onAuthStateChanged(function (user) {
+        if (initialAuthStateHandled) return;
+        initialAuthStateHandled = true;
+        if (user) {
+          initializeFirebaseUser(user).catch(handleFirebaseAuthFailure);
+        } else {
+          auth.signInAnonymously().then(function (credential) {
+            return initializeFirebaseUser(credential.user);
+          }).catch(handleFirebaseAuthFailure);
         }
-        activeUid = getTargetUid();
-        var syncDisplay = document.getElementById("syncIdDisplay");
-        if (syncDisplay) syncDisplay.textContent = activeUid + " (Local preview mode)";
-        renderDeviceList(null);
-        loadLocalStore();
-      });
+      }, handleFirebaseAuthFailure);
 
     } catch (err) {
       console.error("Firebase init error:", err);
