@@ -893,6 +893,16 @@ To Do — Cloud Persistent Single-File App (Cloud Firestore + Anonymous Auth)
             </div>
             <button class="btn-outline" type="button" id="signInGoogleBtn" style="padding:5px 12px; font-size:12.5px;">Connect Google account</button>
           </div>
+          <div class="category-row" style="padding: 12px 8px; flex-wrap:wrap; gap:8px;">
+            <div style="flex:1; min-width:180px;">
+              <div style="font-size:13.5px; color:var(--ink-muted);">File backup</div>
+              <div style="font-size:12px; color:var(--ink-faint); margin-top:3px;">Export to move tasks between file copies, or merge a backup here.</div>
+            </div>
+            <button class="btn-outline" type="button" id="exportBackupBtn" style="padding:5px 12px; font-size:12.5px;">Export backup</button>
+            <button class="btn-outline" type="button" id="importBackupBtn" style="padding:5px 12px; font-size:12.5px;">Import backup</button>
+            <input id="importBackupFile" type="file" accept="application/json,.json" style="display:none;">
+          </div>
+          <div id="backupStatus" class="device-empty" role="status" aria-live="polite" style="padding:0 8px 10px;"></div>
           <div class="toggle-row">
             <div class="toggle-copy">
               <div class="toggle-label">Automatically sync changes</div>
@@ -1750,6 +1760,137 @@ To Do — Cloud Persistent Single-File App (Cloud Firestore + Anonymous Auth)
     } catch (err) {}
   }
 
+  function setBackupStatus(message) {
+    var status = document.getElementById("backupStatus");
+    if (status) status.textContent = message;
+  }
+
+  function exportWorkspaceBackup() {
+    var backupSettings = Object.assign({}, settings);
+    delete backupSettings.autoSync;
+    var backup = {
+      format: "todo-workspace-backup",
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      tasks: tasks,
+      categories: categories,
+      tags: tags,
+      settings: backupSettings
+    };
+    var blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
+    var url = URL.createObjectURL(blob);
+    var link = document.createElement("a");
+    link.href = url;
+    link.download = "todo-backup-" + getLocalDateString() + ".json";
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+    setBackupStatus("Backup exported.");
+  }
+
+  function mergeRecordsById(currentRecords, importedRecords, collectionName) {
+    var merged = currentRecords.slice();
+    importedRecords.forEach(function (record) {
+      if (!record || typeof record !== "object" || typeof record.id !== "string" || !record.id) {
+        throw new Error("The backup contains an invalid " + collectionName + " record.");
+      }
+      var existingIndex = merged.map(function (item) { return item.id; }).indexOf(record.id);
+      if (existingIndex === -1) merged.push(record);
+      else merged[existingIndex] = record;
+    });
+    return merged;
+  }
+
+  function validateWorkspaceBackup(backup) {
+    if (!backup || backup.format !== "todo-workspace-backup" || backup.version !== 1) {
+      throw new Error("This file is not a supported To Do backup.");
+    }
+    ["tasks", "categories", "tags"].forEach(function (key) {
+      if (!Array.isArray(backup[key])) throw new Error("The backup is missing its " + key + " list.");
+    });
+    if (!backup.settings || typeof backup.settings !== "object" || Array.isArray(backup.settings)) {
+      throw new Error("The backup settings are invalid.");
+    }
+  }
+
+  function persistImportedCollection(collectionName, records) {
+    var collectionRef = db.collection("users").doc(activeUid).collection(collectionName);
+    var commits = [];
+    for (var start = 0; start < records.length; start += 400) {
+      var batch = db.batch();
+      records.slice(start, start + 400).forEach(function (record) {
+        var data = Object.assign({}, record);
+        delete data.id;
+        batch.set(collectionRef.doc(record.id), data, { merge: true });
+      });
+      commits.push(batch.commit());
+    }
+    return Promise.all(commits);
+  }
+
+  function importWorkspaceBackup(backup) {
+    validateWorkspaceBackup(backup);
+    var importedTasks = mergeRecordsById(tasks, backup.tasks, "task");
+    var importedCategories = mergeRecordsById(categories, backup.categories, "category");
+    var importedTags = mergeRecordsById(tags, backup.tags, "tag");
+    var importedSettings = Object.assign({}, settings, backup.settings, { autoSync: settings.autoSync });
+
+    function applyImportedData() {
+      tasks = importedTasks;
+      categories = importedCategories;
+      tags = importedTags;
+      settings = importedSettings;
+      renderCategoriesList();
+      renderTagsList();
+      renderSections();
+      applySettingsUI();
+      if (!isFirebaseConfigured || !db || !activeUid) saveLocalStore();
+    }
+
+    if (isFirebaseConfigured && db && activeUid) {
+      var settingsRef = db.collection("users").doc(activeUid).collection("settings").doc("preferences");
+      return Promise.all([
+        persistImportedCollection("tasks", importedTasks),
+        persistImportedCollection("categories", importedCategories),
+        persistImportedCollection("tags", importedTags),
+        settingsRef.set(backup.settings, { merge: true })
+      ]).then(applyImportedData);
+    }
+
+    applyImportedData();
+    return Promise.resolve();
+  }
+
+  document.getElementById("exportBackupBtn").addEventListener("click", exportWorkspaceBackup);
+  document.getElementById("importBackupBtn").addEventListener("click", function () {
+    document.getElementById("importBackupFile").click();
+  });
+  document.getElementById("importBackupFile").addEventListener("change", function () {
+    var file = this.files && this.files[0];
+    if (!file) return;
+    var reader = new FileReader();
+    reader.onload = function () {
+      try {
+        var backup = JSON.parse(String(reader.result || ""));
+        importWorkspaceBackup(backup).then(function () {
+          setBackupStatus("Backup merged. Existing tasks were kept; matching IDs were updated.");
+        }).catch(function (err) {
+          console.error("Backup import failed:", err);
+          setBackupStatus("Import failed. Your current data was left unchanged.");
+        });
+      } catch (err) {
+        setBackupStatus(err.message || "That file is not a valid To Do backup.");
+      }
+      document.getElementById("importBackupFile").value = "";
+    };
+    reader.onerror = function () {
+      setBackupStatus("Could not read that backup file.");
+      document.getElementById("importBackupFile").value = "";
+    };
+    reader.readAsText(file);
+  });
+
   function legacyImportanceTagIds() {
     return tags.filter(function (tag) {
       return /^(high|medium|low)$/i.test(String(tag.name || "").trim());
@@ -1821,6 +1962,10 @@ To Do — Cloud Persistent Single-File App (Cloud Firestore + Anonymous Auth)
 
   function handleFirebaseAuthFailure(err) {
     console.warn("Firebase authentication failed, falling back to local mode:", err);
+    stopFirestoreDataSync();
+    isFirebaseConfigured = false;
+    db = null;
+    auth = null;
     var banner = document.getElementById("configBanner");
     if (banner) {
       banner.innerHTML = "<strong>Firebase Auth notice:</strong> Enable Anonymous sign-in in Firebase Authentication to use local preview sync.";
@@ -1832,9 +1977,28 @@ To Do — Cloud Persistent Single-File App (Cloud Firestore + Anonymous Auth)
     loadLocalStore();
   }
 
+  function startLocalFileMode() {
+    isFirebaseConfigured = false;
+    db = null;
+    auth = null;
+    activeUid = getTargetUid();
+    updateSyncAccountUI(null);
+    var status = document.getElementById("syncAccountStatus");
+    var googleButton = document.getElementById("signInGoogleBtn");
+    if (status) status.textContent = "Local file mode. Use backups to move data between devices.";
+    if (googleButton) googleButton.disabled = true;
+    renderDeviceList(null);
+    loadLocalStore();
+  }
+
   function initApp() {
     renderHeaderDate();
     initDeviceName();
+
+    if (window.location.protocol === "file:") {
+      startLocalFileMode();
+      return;
+    }
 
     isFirebaseConfigured = checkFirebaseConfig();
 
