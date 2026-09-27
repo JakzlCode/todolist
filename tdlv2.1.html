@@ -889,15 +889,16 @@ To Do — Cloud Persistent Single-File App (Cloud Firestore + Anonymous Auth)
           <div class="category-row" style="padding: 12px 8px; flex-wrap:wrap; gap:8px;">
             <div style="flex:1; min-width:180px;">
               <div style="font-size:13.5px; color:var(--ink-muted);">Sync account</div>
-              <div id="syncAccountStatus" style="font-size:12px; color:var(--ink-faint); margin-top:3px;">Not connected</div>
+              <div id="syncAccountStatus" role="status" aria-live="polite" style="font-size:12px; color:var(--ink-faint); margin-top:3px;">Not connected</div>
             </div>
-            <button class="btn-outline" type="button" id="signInGoogleBtn" style="padding:5px 12px; font-size:12.5px;">Connect Google account</button>
+            <button class="btn-text" type="button" id="signOutAccountBtn" style="display:none;">Sign out</button>
           </div>
           <div class="add-inline sync-email-row" style="padding:12px 8px; flex-wrap:wrap;">
             <input type="email" id="syncAccountEmail" autocomplete="username" placeholder="Email address" aria-label="Sync account email">
             <input type="password" id="syncAccountPassword" autocomplete="current-password" placeholder="Password" aria-label="Sync account password">
             <button class="btn-outline" type="button" id="signInEmailBtn" style="padding:5px 12px; font-size:12.5px;">Sign in</button>
             <button class="btn-outline" type="button" id="createEmailAccountBtn" style="padding:5px 12px; font-size:12.5px;">Create account</button>
+            <button class="btn-text" type="button" id="resetPasswordBtn" style="font-size:12.5px;">Forgot password?</button>
           </div>
           <div class="toggle-row">
             <div class="toggle-copy">
@@ -1558,24 +1559,26 @@ To Do — Cloud Persistent Single-File App (Cloud Firestore + Anonymous Auth)
   });
 
   function updateSyncAccountUI(user) {
-    var button = document.getElementById("signInGoogleBtn");
     var status = document.getElementById("syncAccountStatus");
-    if (!button || !status) return;
+    var emailRow = document.querySelector(".sync-email-row");
+    var signOutButton = document.getElementById("signOutAccountBtn");
+    if (!status) return;
     var fileMode = window.location.protocol === "file:";
-    var googleLinked = !!(user && user.providerData && user.providerData.some(function (provider) { return provider.providerId === "google.com"; }));
     if (user && !user.isAnonymous) {
-      status.textContent = "Connected as " + (user.email || "your account") + ". Use this same account on each device.";
-      button.textContent = googleLinked ? "Google connected" : "Connect Google account";
-      button.disabled = fileMode || googleLinked || !auth;
+      status.textContent = "Signed in as " + (user.email || "your account") + ". This device syncs automatically.";
+      if (emailRow) emailRow.hidden = true;
+      if (signOutButton) signOutButton.style.display = "inline-block";
     } else {
       status.textContent = fileMode
-        ? "File mode: sign in with the same email and password on each copy."
-        : "Use the same Google or email account on each device.";
-      button.textContent = "Connect Google account";
-      button.disabled = fileMode || !auth;
+        ? "File mode: create an email account, then sign into it on each device."
+        : "Create an account once, then use the same email and password on each device.";
+      if (emailRow) emailRow.hidden = false;
+      if (signOutButton) signOutButton.style.display = "none";
     }
-    document.getElementById("signInEmailBtn").disabled = !auth;
-    document.getElementById("createEmailAccountBtn").disabled = !auth;
+    ["signInEmailBtn", "createEmailAccountBtn", "resetPasswordBtn"].forEach(function (id) {
+      var button = document.getElementById(id);
+      if (button) button.disabled = !auth || !!(user && !user.isAnonymous);
+    });
   }
 
   function connectEmailAccount(createAccount) {
@@ -1594,8 +1597,9 @@ To Do — Cloud Persistent Single-File App (Cloud Firestore + Anonymous Auth)
     var fileLocalWorkspace = window.location.protocol === "file:" && (!isFirebaseConfigured || !db);
     var previousWorkspaceId = activeUid || localStorage.getItem("todo_sync_uid");
     localStorage.setItem("todo_pending_workspace_migration", previousWorkspaceId || "");
-    document.getElementById("signInEmailBtn").disabled = true;
-    document.getElementById("createEmailAccountBtn").disabled = true;
+    ["signInEmailBtn", "createEmailAccountBtn", "resetPasswordBtn"].forEach(function (id) {
+      document.getElementById(id).disabled = true;
+    });
     if (status) status.textContent = createAccount ? "Creating account..." : "Signing in...";
 
     var accountRequest = createAccount
@@ -1625,8 +1629,10 @@ To Do — Cloud Persistent Single-File App (Cloud Firestore + Anonymous Auth)
         if (err.code === "auth/operation-not-allowed") status.textContent = "Enable Email/Password sign-in in Firebase Authentication.";
         else if (err.code === "auth/weak-password") status.textContent = "Use a password with at least 6 characters.";
         else if (err.code === "auth/email-already-in-use") status.textContent = "That email already has an account. Choose Sign in.";
+        else if (err.code === "auth/invalid-email") status.textContent = "Enter a valid email address.";
         else if (err.code === "auth/user-not-found" || err.code === "auth/wrong-password" || err.code === "auth/invalid-credential") status.textContent = "Email or password is incorrect. For a new account, choose Create account.";
-        else status.textContent = "Could not connect this account. Check Firebase Authentication settings.";
+        else if (err.code === "auth/too-many-requests") status.textContent = "Too many attempts. Wait a little, then try again.";
+        else status.textContent = "Could not connect. Check the account details and Firebase settings.";
       }
     });
   }
@@ -1638,28 +1644,38 @@ To Do — Cloud Persistent Single-File App (Cloud Firestore + Anonymous Auth)
     connectEmailAccount(true);
   });
 
-  document.getElementById("signInGoogleBtn").addEventListener("click", function () {
-    if (!auth || !firebase || !firebase.auth) return;
-    var button = this;
-    var previousWorkspaceId = activeUid || localStorage.getItem("todo_sync_uid");
-    localStorage.setItem("todo_pending_workspace_migration", previousWorkspaceId || "");
-    button.disabled = true;
-    button.textContent = "Connecting...";
-    var provider = new firebase.auth.GoogleAuthProvider();
-    auth.signInWithPopup(provider).then(function (result) {
-      return migrateWorkspaceData(previousWorkspaceId, result.user.uid).then(function () {
-        localStorage.setItem("todo_sync_uid", result.user.uid);
-        localStorage.removeItem("todo_pending_workspace_migration");
-        window.location.reload();
-      });
+  document.getElementById("resetPasswordBtn").addEventListener("click", function () {
+    var email = document.getElementById("syncAccountEmail").value.trim();
+    var status = document.getElementById("syncAccountStatus");
+    if (!auth || !email) {
+      if (status) status.textContent = "Enter your email address first, then choose Forgot password.";
+      document.getElementById("syncAccountEmail").focus();
+      return;
+    }
+    this.disabled = true;
+    status.textContent = "Sending password reset email...";
+    auth.sendPasswordResetEmail(email).then(function () {
+      status.textContent = "If an account exists for that email, a password reset link has been sent.";
     }).catch(function (err) {
-      console.error("Google sign-in failed:", err);
-      button.disabled = false;
-      button.textContent = "Connect Google account";
-      var status = document.getElementById("syncAccountStatus");
-      if (status) status.textContent = err.code === "auth/operation-not-allowed"
-        ? "Enable Google sign-in in Firebase Authentication settings."
-        : "Could not connect. Check the Google sign-in setup and try again.";
+      console.error("Password reset request failed:", err);
+      if (err.code === "auth/invalid-email") status.textContent = "Enter a valid email address.";
+      else if (err.code === "auth/operation-not-allowed") status.textContent = "Enable Email/Password sign-in in Firebase Authentication.";
+      else if (err.code === "auth/too-many-requests") status.textContent = "Too many attempts. Wait a little, then try again.";
+      else status.textContent = "Could not send a reset email. Check the address and Firebase settings.";
+    }).then(function () {
+      document.getElementById("resetPasswordBtn").disabled = !auth;
+    });
+  });
+
+  document.getElementById("signOutAccountBtn").addEventListener("click", function () {
+    if (!auth || !auth.currentUser || auth.currentUser.isAnonymous) return;
+    this.disabled = true;
+    auth.signOut().then(function () {
+      localStorage.removeItem("todo_sync_uid");
+      window.location.reload();
+    }).catch(function (err) {
+      console.error("Sign out failed:", err);
+      updateSyncAccountUI(auth.currentUser);
     });
   });
 
@@ -1974,9 +1990,10 @@ To Do — Cloud Persistent Single-File App (Cloud Firestore + Anonymous Auth)
       activeUid = getTargetUid();
       updateSyncAccountUI(null);
       var accountStatus = document.getElementById("syncAccountStatus");
-      var accountButton = document.getElementById("signInGoogleBtn");
       if (accountStatus) accountStatus.textContent = "Cloud sync is unavailable in local preview mode.";
-      if (accountButton) accountButton.disabled = true;
+      ["signInEmailBtn", "createEmailAccountBtn", "resetPasswordBtn"].forEach(function (id) {
+        document.getElementById(id).disabled = true;
+      });
       loadLocalStore();
       return;
     }
